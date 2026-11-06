@@ -208,12 +208,15 @@ CI runs formatting, vet, race tests, coverage, real-Redis integration tests and 
 ## 📁 Layout
 
 ```text
-cmd/server/          composition root + graceful shutdown
-internal/domain/     entities, seat rules, errors
-internal/booking/    use cases + repository port
-internal/adapters/   memory and Redis repositories
-internal/httpapi/    routes, middleware, embedded UI
-docs/openapi.yaml    API contract
+cmd/server/            composition root + graceful shutdown
+internal/domain/       entities, movie validation, seat rules, errors
+internal/booking/      booking use cases + repository/catalogue ports
+internal/catalog/      seed catalogue, merge/find helpers, catalogue port
+internal/adapters/     memory and Redis booking + movie stores
+internal/config/       environment configuration and validation
+internal/httpapi/      routes, middleware, embedded admin UI
+docs/openapi.yaml      API contract
+.github/workflows/     CI pipeline
 ```
 
 ---
