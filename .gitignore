@@ -1,0 +1,20 @@
+# Binaries and build output
+/bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local configuration and secrets
+.env
+.env.local
+.env.*.local
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Logs
+*.log

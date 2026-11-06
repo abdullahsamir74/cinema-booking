@@ -1,6 +1,85 @@
+name: cinema-booking
+
 services:
-  redis:
-    container_name: redis
-    image: redis:7-alpine
+  app:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    container_name: cinema-app
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      APP_ADDR: ":8080"
+      BOOKING_STORE: redis
+      REDIS_ADDR: redis:6379
+      HOLD_TTL: ${HOLD_TTL:-2m}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-*}"
+      # Enables the Admin dialog. Override this before exposing the app.
+      ADMIN_TOKEN: "${ADMIN_TOKEN-admin-demo-token}"
     ports:
-      - "6379:6379"
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    networks:
+      - cinema
+
+  redis:
+    container_name: cinema-redis
+    image: redis:8-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - cinema
+
+  # Optional admin UI: docker compose --profile tools up -d
+  redis-commander:
+    container_name: cinema-redis-commander
+    image: rediscommander/redis-commander:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - cinema
+
+networks:
+  cinema:
+    driver: bridge
+
+volumes:
+  redis_data:

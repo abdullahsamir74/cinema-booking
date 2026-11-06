@@ -1,0 +1,616 @@
+openapi: 3.1.0
+info:
+  title: CineBook API
+  version: 1.0.0
+  description: |
+    Concurrent cinema seat reservation API.
+
+    A seat is held for a configurable TTL (default 2 minutes) using an atomic
+    Redis `SET NX` operation. Confirming converts the hold into a permanent
+    booking through a Lua script that checks ownership atomically. Releasing a
+    hold returns the seat to the pool.
+
+    Anonymous demo clients identify themselves with a `user_id` (3-64 letters,
+    numbers, hyphens or underscores). A header (`X-User-ID`) is accepted as an
+    alternative to the JSON body on write endpoints.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local Docker Compose stack
+
+tags:
+  - name: Movies
+    description: Read the movie catalogue and room layouts.
+  - name: Seats
+    description: Inspect seat state and hold, confirm or release a seat.
+  - name: Bookings
+    description: Inspect active reservations for a movie.
+  - name: Admin
+    description: Manage the movie catalogue. Requires the configured admin token.
+  - name: System
+    description: Liveness and readiness probes.
+
+security: []
+
+paths:
+  /movies:
+    get:
+      tags: [Movies]
+      summary: List movies
+      operationId: listMovies
+      responses:
+        "200":
+          description: The catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [movies]
+                properties:
+                  movies:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Movie"
+              example:
+                movies:
+                  - id: inception
+                    title: Inception
+                    description: A thief who steals corporate secrets through dream-sharing technology.
+                    genre: Sci-Fi / Thriller
+                    rating: PG-13
+                    runtime_minutes: 148
+                    rows: 6
+                    seats_per_row: 10
+
+  /movies/{movieID}:
+    get:
+      tags: [Movies]
+      summary: Get one movie
+      operationId: getMovie
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+      responses:
+        "200":
+          description: The movie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movie"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+
+  /movies/{movieID}/seats:
+    get:
+      tags: [Seats]
+      summary: Get the live seat map
+      description: Returns every seat with its current state and a summary count.
+      operationId: getSeatMap
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+      responses:
+        "200":
+          description: The seat map
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SeatMap"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+
+  /movies/{movieID}/seats/{seatID}/hold:
+    post:
+      tags: [Seats]
+      summary: Hold a seat
+      description: |
+        Atomically reserves a seat for `HOLD_TTL`. Under concurrent requests for
+        the same seat exactly one caller receives `201`; everyone else receives
+        `409 seat_unavailable`.
+      operationId: holdSeat
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+        - $ref: "#/components/parameters/SeatID"
+        - $ref: "#/components/parameters/UserIDHeader"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HoldRequest"
+            example:
+              user_id: alice-1
+      responses:
+        "201":
+          description: Seat held
+          headers:
+            Location:
+              schema:
+                type: string
+              description: Link to the movie's seat map
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+        "409":
+          $ref: "#/components/responses/SeatUnavailable"
+    delete:
+      tags: [Seats]
+      summary: Release a hold
+      description: Releases a held seat. Confirmed bookings cannot be released.
+      operationId: releaseSeat
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+        - $ref: "#/components/parameters/SeatID"
+        - $ref: "#/components/parameters/UserIDHeader"
+      responses:
+        "204":
+          description: Hold released
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/NotOwner"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+        "409":
+          $ref: "#/components/responses/BookingConfirmed"
+        "410":
+          $ref: "#/components/responses/HoldExpired"
+
+  /movies/{movieID}/seats/{seatID}/confirm:
+    post:
+      tags: [Seats]
+      summary: Confirm a hold
+      description: Converts the caller's active hold into a permanent booking.
+      operationId: confirmSeat
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+        - $ref: "#/components/parameters/SeatID"
+        - $ref: "#/components/parameters/UserIDHeader"
+      responses:
+        "200":
+          description: Booking confirmed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/NotOwner"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+        "410":
+          $ref: "#/components/responses/HoldExpired"
+
+  /movies/{movieID}/bookings:
+    get:
+      tags: [Bookings]
+      summary: List active reservations for a movie
+      operationId: listBookings
+      parameters:
+        - $ref: "#/components/parameters/MovieID"
+      responses:
+        "200":
+          description: Held and confirmed bookings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bookings]
+                properties:
+                  bookings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Booking"
+        "404":
+          $ref: "#/components/responses/MovieNotFound"
+
+  /admin/movies:
+    post:
+      tags: [Admin]
+      summary: Create a movie
+      description: |
+        Adds a movie to the catalogue and makes its screening room immediately
+        bookable. Requires `Authorization: Bearer <ADMIN_TOKEN>`.
+
+        When `ADMIN_TOKEN` is not configured the endpoint is disabled and
+        returns `503 admin_disabled` instead of allowing anonymous writes.
+      operationId: createMovie
+      security:
+        - adminBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MovieCreate"
+            example:
+              id: my-movie
+              title: My Movie
+              description: An admin-created title.
+              genre: Drama
+              rating: PG-13
+              runtime_minutes: 120
+              rows: 6
+              seats_per_row: 10
+      responses:
+        "201":
+          description: Movie created
+          headers:
+            Location:
+              description: URL of the new movie
+              schema:
+                type: string
+              example: /api/v1/movies/my-movie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Movie"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/MovieExists"
+        "503":
+          $ref: "#/components/responses/AdminDisabled"
+
+  /health:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      operationId: health
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+                service: cinema-booking
+                version: 1.0.0
+
+  /ready:
+    get:
+      tags: [System]
+      summary: Readiness probe
+      description: Pings the configured booking store.
+      operationId: ready
+      responses:
+        "200":
+          description: Store reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: ready
+        "503":
+          description: Store unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+
+components:
+  securitySchemes:
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: |
+        The value of `ADMIN_TOKEN`. If the server was started without an admin
+        token, admin routes respond with `503 admin_disabled`.
+
+  parameters:
+    MovieID:
+      name: movieID
+      in: path
+      required: true
+      description: Movie slug, for example `inception`
+      schema:
+        type: string
+      example: inception
+    SeatID:
+      name: seatID
+      in: path
+      required: true
+      description: Seat identifier such as `A1` (row letter + seat number)
+      schema:
+        type: string
+        pattern: "^[A-Za-z][0-9]{1,2}$"
+      example: A1
+    UserIDHeader:
+      name: X-User-ID
+      in: header
+      required: false
+      description: Client identity. When omitted, send `user_id` in the JSON body instead.
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 64
+        pattern: "^[A-Za-z0-9_-]+$"
+      example: alice-1
+
+  schemas:
+    Movie:
+      type: object
+      required: [id, title, description, genre, rating, runtime_minutes, rows, seats_per_row]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        genre:
+          type: string
+        rating:
+          type: string
+        runtime_minutes:
+          type: integer
+        rows:
+          type: integer
+        seats_per_row:
+          type: integer
+
+    MovieCreate:
+      type: object
+      required: [id, title, runtime_minutes, rows, seats_per_row]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: |
+            URL slug. Input is lowercased and non-alphanumeric runs become
+            hyphens, so `My Movie!` becomes `my-movie`.
+          minLength: 2
+          maxLength: 64
+          pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          examples: [my-movie]
+        title:
+          type: string
+          minLength: 1
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 1000
+        genre:
+          type: string
+          maxLength: 80
+        rating:
+          type: string
+          maxLength: 20
+        runtime_minutes:
+          type: integer
+          minimum: 1
+          maximum: 600
+        rows:
+          type: integer
+          minimum: 1
+          maximum: 26
+        seats_per_row:
+          type: integer
+          minimum: 1
+          maximum: 20
+
+    HoldRequest:
+      type: object
+      required: [user_id]
+      properties:
+        user_id:
+          type: string
+          minLength: 3
+          maxLength: 64
+          pattern: "^[A-Za-z0-9_-]+$"
+      additionalProperties: false
+
+    Booking:
+      type: object
+      required: [id, movie_id, seat_id, user_id, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        movie_id:
+          type: string
+        seat_id:
+          type: string
+        user_id:
+          type: string
+        status:
+          type: string
+          enum: [held, confirmed]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+          description: Present only while the booking is held.
+        confirmed_at:
+          type: string
+          format: date-time
+          description: Present only after confirmation.
+
+    Seat:
+      type: object
+      required: [seat_id, row, number, status]
+      properties:
+        seat_id:
+          type: string
+        row:
+          type: string
+        number:
+          type: integer
+        status:
+          type: string
+          enum: [available, held, confirmed]
+        held_by:
+          type: string
+          description: Present for held seats.
+        booking_id:
+          type: string
+          description: Present for held and confirmed seats.
+        expires_at:
+          type: string
+          format: date-time
+          description: Present for held seats.
+
+    SeatStats:
+      type: object
+      required: [total, available, held, confirmed]
+      properties:
+        total:
+          type: integer
+        available:
+          type: integer
+        held:
+          type: integer
+        confirmed:
+          type: integer
+
+    SeatMap:
+      type: object
+      required: [movie_id, rows, seats_per_row, stats, seats]
+      properties:
+        movie_id:
+          type: string
+        rows:
+          type: integer
+        seats_per_row:
+          type: integer
+        stats:
+          $ref: "#/components/schemas/SeatStats"
+        seats:
+          type: array
+          items:
+            $ref: "#/components/schemas/Seat"
+
+    Health:
+      type: object
+      required: [status, service, version]
+      properties:
+        status:
+          type: string
+        service:
+          type: string
+        version:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              examples: [seat_unavailable]
+            message:
+              type: string
+        request_id:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Invalid input
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            invalidSeat:
+              value:
+                error:
+                  code: invalid_seat_id
+                  message: "invalid seat id: A99 is outside this room"
+                request_id: 4f1c2c9e7f0a4d1a
+    MovieNotFound:
+      description: Movie not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    MovieExists:
+      description: A movie with this id already exists
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: movie_exists
+              message: a movie with this id already exists
+            request_id: 4f1c2c9e7f0a4d1a
+    Unauthorized:
+      description: Missing, malformed or incorrect admin token
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+          example: Bearer realm="admin"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: unauthorized
+              message: a valid admin bearer token is required
+            request_id: 4f1c2c9e7f0a4d1a
+    AdminDisabled:
+      description: The admin API is disabled because no token is configured
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: admin_disabled
+              message: "the admin API is disabled; set ADMIN_TOKEN to enable it"
+            request_id: 4f1c2c9e7f0a4d1a
+    SeatUnavailable:
+      description: Seat already held or confirmed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: seat_unavailable
+              message: seat is already held or confirmed
+            request_id: 4f1c2c9e7f0a4d1a
+    NotOwner:
+      description: The seat is held by another user
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    HoldExpired:
+      description: The hold no longer exists or expired
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BookingConfirmed:
+      description: Confirmed bookings cannot be released
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
